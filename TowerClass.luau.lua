@@ -151,8 +151,8 @@ function TowerClass.Spawn(self: TowerClass, SpawnCFrame: CFrame)
 	-- Throttle target searching so we don't sort/scan every frame.
 	self.LastSearchForTarget = tick()
 
-	-- Heartbeat runs each frame on the server; we use dt for cooldown timing.
-	self.func = RunService.Heartbeat:Connect(function(dt)
+	--  we use dt for cooldown timing.
+	self.func = RunService.RenderStepped:Connect(function(dt)
 		self:Update(dt)
 	end)
 end
@@ -398,6 +398,7 @@ function TowerClass.Disable(self: TowerClass)
 end
 
 return TowerClass
+
 
 
 
