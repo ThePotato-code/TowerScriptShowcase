@@ -12,7 +12,7 @@
 	- This script assumes the Tower model has a PrimaryPart and a Part named "Spawn".
 	
 	- Bullets are purely visual.
-	- THe script is purely client sided
+	- THe script is purely client sided with only a damage verification
 ]]
 
 local TowerClass = {}
@@ -394,6 +394,7 @@ function TowerClass.Disable(self: TowerClass)
 end
 
 return TowerClass
+
 
 
 
