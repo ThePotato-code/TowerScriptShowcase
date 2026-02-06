@@ -98,8 +98,8 @@ local function HasLineOfSight(Tower: Model, Enemy: Model, range: number): boolea
 	end
 
 	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Include
-	params.FilterDescendantsInstances = { Enemy }
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { Tower }
 
 	local dir = CalculateDirection(Tower, Enemy)
 	local ray = workspace:Raycast(Start.Position, dir * range, params)
@@ -394,5 +394,6 @@ function TowerClass.Disable(self: TowerClass)
 end
 
 return TowerClass
+
 
 
