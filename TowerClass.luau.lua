@@ -21,9 +21,14 @@ TowerClass.__index = TowerClass
 --// Services
 local RunService = game:GetService("RunService")
 local RP = game:GetService("ReplicatedStorage")
-local Networker = require(RP.Packages.Networker).server
 local TweenService = game:GetService("TweenService")
 local Debris = game:GetService("Debris")
+local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+--// Remotes
+local TowerRemotes = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Tower")
+local ValidateAttackRemote = TowerRemotes:WaitForChild("ValidateTowerAttack")
 
 --// Config typing (values passed into TowerClass.new)
 type Configs = {
@@ -202,8 +207,7 @@ function TowerClass.Attack(self: TowerClass)
 	local Direction = CalculateDirection(self.Model, self.Target)
 	_ = Direction
 
-	-- We require a Humanoid for damage.
-	local TargetHum = assert(self.Target:FindFirstChildOfClass("Humanoid"), "Enemy Humanoid does not exist")
+	
 
 	-- Damage falloff is based on distance.
 	local CalculateDamage = self:CalculateDamage()
@@ -212,7 +216,7 @@ function TowerClass.Attack(self: TowerClass)
 	self:PlayAnim()
 
 	-- Apply damage
-	TargetHum.Health -= CalculateDamage
+	ValidateAttackRemote:FireServer(CalculateDamage,self.Target,self.Model) --Sending a remote to verify the attack of the target. Server looks at things like cooldown Distance and them validates and makes the damage happen
 
 	-- Clean up dead enemies.
 	if EnemyIsDead(self.Target) then
@@ -227,7 +231,7 @@ end
 	then sort by closest distance, and pick the closest.
 ]]
 function TowerClass.SearchForTarget(self: TowerClass)
-	local CurrentEnemies = workspace.Enemies:GetChildren()
+	local CurrentEnemies = CollectionService:GetTagged("Enemy")
 	local EnemiesInRange: { Model } = {}
 
 	-- Iterate array returned by GetChildren()
@@ -394,6 +398,7 @@ function TowerClass.Disable(self: TowerClass)
 end
 
 return TowerClass
+
 
 
 
