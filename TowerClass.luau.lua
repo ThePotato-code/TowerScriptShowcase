@@ -226,7 +226,7 @@ function TowerClass.Attack(self: TowerClass)
 end
 
 --[[
-	Searches for a target from workspace.Enemies.
+	Searches for a target which has the tah Enemy.
 	We build a list of enemies within range (and with line-of-sight),
 	then sort by closest distance, and pick the closest.
 ]]
@@ -398,6 +398,7 @@ function TowerClass.Disable(self: TowerClass)
 end
 
 return TowerClass
+
 
 
 
