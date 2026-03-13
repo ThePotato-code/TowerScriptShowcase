@@ -12,48 +12,48 @@
 	- This script assumes the Tower model has a PrimaryPart and a Part named "Spawn".
 	
 	- Bullets are purely visual.
-	- THe script is purely client sided with only a damage verification
+	- The script is purely client sided with only a damage verification
 ]]
 
-local TowerClass = {}
-TowerClass.__index = TowerClass
+local TowerClass = {} -- The main class table; all methods and metamethods live here
+TowerClass.__index = TowerClass -- Redirect index lookups to TowerClass so instances inherit all methods
 
 --// Services
-local RunService = game:GetService("RunService")
-local RP = game:GetService("ReplicatedStorage")
-local TweenService = game:GetService("TweenService")
-local Debris = game:GetService("Debris")
-local CollectionService = game:GetService("CollectionService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")         -- Used for the per-frame Heartbeat/RenderStepped loop
+local RP = game:GetService("ReplicatedStorage")          -- Kept for potential future use (currently unused alias)
+local TweenService = game:GetService("TweenService")     -- Drives the visual bullet animation
+local Debris = game:GetService("Debris")                 -- Safety-cleanup for bullet parts if the tween is interrupted
+local CollectionService = game:GetService("CollectionService") -- Retrieves all instances tagged "Enemy" for targeting
+local ReplicatedStorage = game:GetService("ReplicatedStorage") -- Used to locate the ValidateTowerAttack remote
 
 --// Remotes
-local TowerRemotes = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Tower")
-local ValidateAttackRemote = TowerRemotes:WaitForChild("ValidateTowerAttack")
+local TowerRemotes = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Tower") -- Folder containing all tower-related RemoteEvents/Functions
+local ValidateAttackRemote = TowerRemotes:WaitForChild("ValidateTowerAttack")         -- Remote the client fires to ask the server to validate and apply damage
 
 --// Config typing (values passed into TowerClass.new)
 type Configs = {
-	Range: number,    -- how far the tower can detect / attack enemies
-	Damage: number,   -- base damage per shot (before falloff)
-	Price: number,    -- cost of the tower (for a shop system, etc.)
-	Owner: Player,    -- player that owns/placed the tower
-	Speed: number,    -- visual bullet speed (studs/sec-ish; used for tween duration)
+	Range: number,    -- How far (in studs) the tower can detect and attack enemies
+	Damage: number,   -- Base damage dealt per shot before distance falloff is applied
+	Price: number,    -- Purchase cost of this tower (used by a shop/placement system)
+	Owner: Player,    -- The Player instance who owns/placed this tower
+	Speed: number,    -- Visual bullet travel speed in studs per second (controls tween duration)
 }
 
 --// TowerClass instance type (helps strict mode + autocomplete)
 export type TowerClass = typeof(setmetatable({} :: {
-	Target: Model | any,                 -- current target (enemy model)
-	Range: number,                       -- detection range
-	Damage: number,                      -- base damage
-	Cooldown: number,                    -- time until next shot
-	Price: number,                       -- tower price
-	Owner: Player,                       -- tower owner
-	LastAttack: number,                  -- (reserved) last attack time
-	Model: Model | any,                  -- cloned tower model
-	Speed: number,                       -- bullet visual speed
-	func: RBXScriptConnection,           -- heartbeat connection
-	LastSearchForTarget: number,         -- timer for throttling target searches
-	Tween: Tween,                        -- current bullet tween (visual)
-	IsActive: boolean,                   -- if false, tower stops updating/attacking
+	Target: Model | any,                 -- The enemy Model currently being targeted (nil when idle)
+	Range: number,                       -- Detection and attack range copied from Configs
+	Damage: number,                      -- Base damage per shot copied from Configs
+	Cooldown: number,                    -- Seconds remaining before the tower can fire again
+	Price: number,                       -- Tower price copied from Configs
+	Owner: Player,                       -- Owning player copied from Configs
+	LastAttack: number,                  -- Reserved timestamp; not actively used yet
+	Model: Model | any,                  -- The cloned tower Model placed in the world
+	Speed: number,                       -- Bullet visual speed copied from Configs (default 100)
+	func: RBXScriptConnection,           -- Stores the RenderStepped connection so it can be disconnected on cleanup
+	LastSearchForTarget: number,         -- Timestamp of the last target scan; throttles scanning to every 0.2 s
+	Tween: Tween,                        -- Reference to the most recent bullet tween; paused/destroyed on cleanup
+	IsActive: boolean,                   -- Master on/off switch; false = tower skips all Update logic
 }, TowerClass))
 
 --[[
@@ -61,10 +61,10 @@ export type TowerClass = typeof(setmetatable({} :: {
 	This is used for range checks and target sorting.
 ]]
 local function CalculateDistance(Tower: Model, Enemy: Model): number
-	assert(Tower.PrimaryPart, "Tower does not posses a primary part")
-	assert(Enemy.PrimaryPart, "Enemy does not posses a primary part")
+	assert(Tower.PrimaryPart, "Tower does not posses a primary part") -- Guard: crash early with a clear message instead of a cryptic nil error
+	assert(Enemy.PrimaryPart, "Enemy does not posses a primary part") -- Guard: same protection for the enemy side
 
-	return (Enemy.PrimaryPart.Position - Tower.PrimaryPart.Position).Magnitude
+	return (Enemy.PrimaryPart.Position - Tower.PrimaryPart.Position).Magnitude -- Vector subtraction gives the displacement; .Magnitude gives the scalar distance
 end
 
 --[[
@@ -73,87 +73,85 @@ end
 	If no humanoid exists, this returns false (enemy is treated as alive/invalid elsewhere).
 ]]
 local function EnemyIsDead(Enemy: Model): boolean
-	local hum = Enemy:FindFirstChildOfClass("Humanoid")
-	return hum ~= nil and hum.Health <= 0
+	local hum = Enemy:FindFirstChildOfClass("Humanoid") -- Search the model for the first (and usually only) Humanoid
+	return hum ~= nil and hum.Health <= 0               -- Enemy is dead only if a Humanoid exists AND its health has hit zero
 end
 
 --[[
 	Returns the unit direction vector from tower to enemy.
-	This is used for raycast direction (line-of-sight) and can be reused for projectiles altough not here.
+	This is used for raycast direction (line-of-sight) and can be reused for projectiles although not here.
 ]]
 local function CalculateDirection(Tower: Model, Enemy: Model): Vector3
-	assert(Tower.PrimaryPart, "Tower does not posses a primary part")
-	assert(Enemy.PrimaryPart, "Enemy does not posses a primary part")
+	assert(Tower.PrimaryPart, "Tower does not posses a primary part") -- Guard: ensure the tower has a valid root part
+	assert(Enemy.PrimaryPart, "Enemy does not posses a primary part") -- Guard: ensure the enemy has a valid root part
 
-	return (Enemy.PrimaryPart.Position - Tower.PrimaryPart.Position).Unit
+	return (Enemy.PrimaryPart.Position - Tower.PrimaryPart.Position).Unit -- Subtract positions to get the raw vector, then normalize to length 1 with .Unit
 end
 
 --[[
 	Line-of-sight check between tower and enemy.
 	We raycast from the tower's PrimaryPart toward the enemy depending on the range.
-	FilterType = Include with {Enemy} means we only "care" about hits on the enemy model.
+	FilterType = Exclude with {Tower} means we skip the tower's own parts when casting.
 
-	If nothing is hit, or we hit something inside the enemy, we consider LOS true.
+	If nothing is hit, or we hit something inside the enemy, we consider LOS clear.
 ]]
 local function HasLineOfSight(Tower: Model, Enemy: Model, range: number): boolean | any
-	local Start = Tower.PrimaryPart
-	local End = Enemy.PrimaryPart
-	if not Start or not End then
+	local Start = Tower.PrimaryPart -- Ray origin: the tower's root part
+	local End = Enemy.PrimaryPart   -- Ray destination reference: the enemy's root part
+	if not Start or not End then    -- If either part is missing, we can't cast; return nil (falsy)
 		return
 	end
 
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = { Tower }
+	local params = RaycastParams.new()                                     -- Create fresh raycast parameters for this check
+	params.FilterType = Enum.RaycastFilterType.Exclude                     -- Exclude mode: the listed instances are ignored by the ray
+	params.FilterDescendantsInstances = { Tower }                          -- Exclude the tower itself so the ray doesn't immediately self-intersect
 
-	local dir = CalculateDirection(Tower, Enemy)
-	local ray = workspace:Raycast(Start.Position, dir * range, params)
+	local dir = CalculateDirection(Tower, Enemy)                           -- Get the normalised direction vector toward the enemy
+	local ray = workspace:Raycast(Start.Position, dir * range, params)    -- Cast the ray up to `range` studs in that direction
 
-	return ray == nil or ray.Instance:IsDescendantOf(Enemy)
+	return ray == nil or ray.Instance:IsDescendantOf(Enemy) -- LOS is clear if nothing was hit, OR if the first hit belongs to the enemy model itself
 end
 
 --[[
 	Constructor.
 	We clone the provided model so each tower instance has its own copy.
-	
 ]]
 function TowerClass.new(Model: Model, configs: Configs)
-	local self = setmetatable({
-		Target = nil,                  -- no target at the start
-		Range = configs.Range,
-		Damage = configs.Damage,
-		Price = configs.Price,
-		Owner = configs.Owner,
+	local self = setmetatable({ -- Create a plain table and attach TowerClass as its metatable so it inherits all methods
+		Target = nil,                  -- No target selected yet; SearchForTarget will fill this in
+		Range = configs.Range,         -- Copy detection/attack range from configs
+		Damage = configs.Damage,       -- Copy base damage from configs
+		Price = configs.Price,         -- Copy purchase price from configs
+		Owner = configs.Owner,         -- Copy owning player reference from configs
 
-		LastAttack = 0,                -- reserved 
-		Model = Model:Clone(),
+		LastAttack = 0,                -- Reserved for potential future cooldown stamping (not used in current logic)
+		Model = Model:Clone(),         -- Clone the source model so this instance has its own independent copy
 
-		func = nil,                    -- heartbeat connection will be set on Spawn
-		Cooldown = 0,                  -- can shoot immediately
+		func = nil,                    -- Will be set to the RenderStepped connection when Spawn() is called
+		Cooldown = 0,                  -- Start at 0 so the tower can fire immediately after spawning
 
-		ProjectileFunc = nil,          -- reserved for future (e.g., projectile update)
-		Speed = configs.Speed or 100,  -- visual bullet speed default
+		ProjectileFunc = nil,          -- Reserved slot for a future projectile update connection
+		Speed = configs.Speed or 100,  -- Use provided bullet speed, falling back to 100 studs/s if omitted
 
-		IsActive = true,               -- tower starts enabled
+		IsActive = true,               -- Tower starts in the active (enabled) state
 	}, TowerClass)
 
-	return self
+	return self -- Return the fully initialised instance to the caller
 end
 
 --[[
 	Spawns the tower into the world.
-	Starts a Heartbeat update loop that drives targeting, aiming, and attacking.
+	Starts a RenderStepped update loop that drives targeting, aiming, and attacking.
 ]]
 function TowerClass.Spawn(self: TowerClass, SpawnCFrame: CFrame)
-	self.Model:PivotTo(SpawnCFrame)
-	self.Model.Parent = workspace
+	self.Model:PivotTo(SpawnCFrame) -- Move (and rotate) the cloned model to the desired placement CFrame
+	self.Model.Parent = workspace   -- Parent into workspace to make the model visible in the world
 
-	-- Throttle target searching so we don't sort/scan every frame.
-	self.LastSearchForTarget = tick()
+	self.LastSearchForTarget = tick() -- Initialise the throttle timer so the first scan isn't skipped
 
-	--  we use dt for cooldown timing.
+	-- Connect the per-frame update; dt (delta time) is passed in for cooldown and lerp calculations.
 	self.func = RunService.RenderStepped:Connect(function(dt)
-		self:Update(dt)
+		self:Update(dt) -- Delegate all per-frame logic to the Update method
 	end)
 end
 
@@ -164,30 +162,30 @@ end
 	- If target exists: tick cooldown, attack when ready, and aim smoothly.
 ]]
 function TowerClass.Update(self: TowerClass, dt: number)
-	if not self.IsActive then
+	if not self.IsActive then -- If the tower has been disabled, skip all logic this frame
 		return
 	end
 
-	-- Acquire target if we don't currently have one.
+	-- Acquire a target if we currently have none.
 	if not self.Target then
-		if tick() - self.LastSearchForTarget >= 0.2 then
-			self.LastSearchForTarget = tick()
-			self:SearchForTarget()
+		if tick() - self.LastSearchForTarget >= 0.2 then -- Only scan every 0.2 s to avoid expensive per-frame sorting
+			self.LastSearchForTarget = tick()             -- Reset the throttle timer
+			self:SearchForTarget()                        -- Run the range + LOS scan and assign self.Target if found
 		end
-		return
+		return -- Nothing more to do until we have a target
 	end
 
-	-- If we have a target, make sure it's still valid.
+	-- We have a target; confirm it is still alive, in range, and valid.
 	if self.Target and self:ValidateTarget() then
-		-- Cooldown timer controls fire rate.
+		-- Count down the remaining cooldown using real elapsed time.
 		if self.Cooldown > 0 then
-			self.Cooldown -= dt
+			self.Cooldown -= dt -- Subtract this frame's elapsed time from the remaining cooldown
 		else
-			self.Cooldown = 0.5 -- fire rate (seconds between shots)
-			self:Attack()
+			self.Cooldown = 0.5 -- Reset cooldown to 0.5 s (defines the fire rate: 2 shots per second)
+			self:Attack()       -- Fire at the validated target
 		end
 
-		-- Smoothly rotate toward the target each frame.
+		-- Smoothly rotate the tower toward the target each frame regardless of fire readiness.
 		self:AimAt(dt)
 	end
 end
@@ -199,64 +197,62 @@ end
 	- If enemy dies, it is destroyed and target resets.
 ]]
 function TowerClass.Attack(self: TowerClass)
-	if not self:ValidateTarget() then --Validating the target
+	if not self:ValidateTarget() then -- Re-validate right before firing; target might have just died or left range
 		return
 	end
 
-	-- Direction is currently unused, but it's useful if you later add ballistic projectiles.
+	-- Calculate the direction to the target (currently unused directly, reserved for ballistic projectiles).
 	local Direction = CalculateDirection(self.Model, self.Target)
-	_ = Direction
+	_ = Direction -- Explicitly discard to silence the unused-variable warning under --!strict
 
-	
+	-- Compute damage with distance falloff applied.
+	local CalculateDamage = self:CalculateDamage() -- Returns a rounded integer damage value
 
-	-- Damage falloff is based on distance.
-	local CalculateDamage = self:CalculateDamage()
-
-	-- Visual bullet
+	-- Spawn the visual-only bullet tween toward the target.
 	self:PlayAnim()
 
-	-- Apply damage
-	ValidateAttackRemote:FireServer(CalculateDamage,self.Target,self.Model) --Sending a remote to verify the attack of the target. Server looks at things like cooldown Distance and them validates and makes the damage happen
+	-- Tell the server about the attack so it can re-validate range, cooldown, etc. and apply actual health reduction.
+	ValidateAttackRemote:FireServer(CalculateDamage, self.Target, self.Model)
 
-	-- Clean up dead enemies.
+	-- If the humanoid is already at 0 HP client-side, clean up the enemy model immediately.
 	if EnemyIsDead(self.Target) then
-		self.Target:Destroy()
-		self.Target = nil
+		self.Target:Destroy() -- Remove the enemy model from the workspace
+		self.Target = nil     -- Clear the reference so the tower starts scanning for a new target
 	end
 end
 
 --[[
-	Searches for a target which has the tah Enemy.
+	Searches for a target which has the tag "Enemy".
 	We build a list of enemies within range (and with line-of-sight),
 	then sort by closest distance, and pick the closest.
 ]]
 function TowerClass.SearchForTarget(self: TowerClass)
-	local CurrentEnemies = CollectionService:GetTagged("Enemy")
-	local EnemiesInRange: { Model } = {}
+	local CurrentEnemies = CollectionService:GetTagged("Enemy") -- Get every instance currently tagged "Enemy" in the game
+	local EnemiesInRange: { Model } = {}                        -- Accumulator for enemies that pass range + LOS checks
 
-	-- Iterate array returned by GetChildren()
+	-- Iterate the tagged instances and filter down to valid candidates.
 	for _, Enemy in ipairs(CurrentEnemies) do
-		if Enemy:IsA("Model") then
-			local Distance = CalculateDistance(self.Model, Enemy)
+		if Enemy:IsA("Model") then -- Only consider full Models (ignores any accidentally tagged non-models)
+			local Distance = CalculateDistance(self.Model, Enemy) -- Measure studs between tower and this enemy
 
-			-- Range check + FoV check before accepting this enemy as a valid candidate.
+			-- Accept the enemy only if it's within attack range AND has an unobstructed line of sight.
 			if Distance <= self.Range and HasLineOfSight(self.Model, Enemy, self.Range) then
-				table.insert(EnemiesInRange, Enemy)
+				table.insert(EnemiesInRange, Enemy) -- Add to the candidate list for sorting
 			end
 		end
 	end
 
-	-- If nothing in range, bail out.
+	-- No valid targets found this scan; leave self.Target as nil and wait for the next throttled scan.
 	if #EnemiesInRange == 0 then
 		return
 	end
 
-	-- Sort by closest distance so EnemiesInRange[1] becomes the closest.
+	-- Sort candidates ascending by distance so index [1] is the closest enemy.
 	table.sort(EnemiesInRange, function(a: Model, b: Model)
-		return CalculateDistance(self.Model, a) < CalculateDistance(self.Model, b)
+		return CalculateDistance(self.Model, a) < CalculateDistance(self.Model, b) -- Comparator: true when a is closer than b
 	end)
 
-	self.Target = EnemiesInRange[1]
+	self.Target = EnemiesInRange[1] -- Assign the nearest valid enemy as the active target
 end
 
 --[[
@@ -265,23 +261,23 @@ end
 	or walks out of range.
 ]]
 function TowerClass.ValidateTarget(self: TowerClass)
-	if not self.Target or not self.Target.Parent then
-		self.Target = nil
-		return false
+	if not self.Target or not self.Target.Parent then -- Target is nil OR has been removed from the DataModel
+		self.Target = nil  -- Ensure the field is explicitly nil (handles the "not self.Target" branch too)
+		return false       -- Signal that validation failed
 	end
 
-	if not self.Target.PrimaryPart then
-		self.Target = nil
-		return false
+	if not self.Target.PrimaryPart then -- PrimaryPart can be removed independently (e.g., ragdoll systems)
+		self.Target = nil -- Drop the invalid target reference
+		return false      -- Signal that validation failed
 	end
 
-	-- If the enemy walks out of range, drop target and rescan later.
+	-- Drop the target if it has walked or been pushed outside the tower's attack range.
 	if CalculateDistance(self.Model, self.Target) > self.Range then
-		self.Target = nil
-		return false
+		self.Target = nil -- Clear target; SearchForTarget will find a new one on the next throttled scan
+		return false      -- Signal that validation failed
 	end
 
-	return true
+	return true -- All checks passed; target is still valid
 end
 
 --[[
@@ -289,43 +285,42 @@ end
 	No hit detection is done here because damage is applied instantly in Attack().
 ]]
 function TowerClass.PlayAnim(self: TowerClass)
-	if not self:ValidateTarget() then
+	if not self:ValidateTarget() then -- Abort if the target became invalid between Attack() and PlayAnim()
 		return
 	end
 
-	-- "Spawn" is used as the bullet origin.
-	local BulletSpawn: Part = self.Model:FindFirstChild("Spawn")
-	local TargetPrim = self.Target.PrimaryPart
-	if not BulletSpawn or not TargetPrim then
+	local BulletSpawn: Part = self.Model:FindFirstChild("Spawn") -- Find the designated bullet origin part on the tower model
+	local TargetPrim = self.Target.PrimaryPart                   -- Cache the target's root part position as the tween goal
+	if not BulletSpawn or not TargetPrim then                    -- If either part is missing, we can't animate; bail out
 		return
 	end
 
-	local Goal = { Position = TargetPrim.Position }
-	local Distance = CalculateDistance(self.Model, self.Target)
+	local Goal = { Position = TargetPrim.Position }               -- Tween will move the bullet to the enemy's current position
+	local Distance = CalculateDistance(self.Model, self.Target)   -- Distance is used to scale travel time proportionally
 
-	-- Travel time depends on distance and configured bullet speed.
+	-- Clamp travel time between 0.2 s (minimum visible) and 1.5 s (maximum for very far targets).
 	local TravelTime = math.clamp(Distance / self.Speed, 0.2, 1.5)
-	local TI = TweenInfo.new(TravelTime, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
+	local TI = TweenInfo.new(TravelTime, Enum.EasingStyle.Linear, Enum.EasingDirection.Out) -- Linear easing gives a constant-speed bullet feel
 
-	-- We parent into workspace.Ignore so visuals are easy to manage/ignore in raycasts.
+	-- Create the bullet part inside workspace.Ignore so raycasts can easily exclude all bullets at once.
 	local Bullet = Instance.new("Part", workspace.Ignore)
-	Bullet.CanCollide = false
-	Bullet.Anchored = true
-	Bullet.Massless = true
-	Bullet.Position = BulletSpawn.Position
-	Bullet.Material = Enum.Material.Neon
-	Bullet.Color = Color3.new(1, 0, 0)
-	Bullet.Size = Vector3.new(2, 2, 2)
+	Bullet.CanCollide = false             -- Bullet must not physically interact with anything
+	Bullet.Anchored = true                -- Must be anchored so TweenService can control its position
+	Bullet.Massless = true                -- Massless prevents it from affecting physics even briefly
+	Bullet.Position = BulletSpawn.Position -- Start at the barrel/spawn part of the tower
+	Bullet.Material = Enum.Material.Neon  -- Neon material makes the bullet glow for visibility
+	Bullet.Color = Color3.new(1, 0, 0)    -- Bright red colour for easy identification
+	Bullet.Size = Vector3.new(2, 2, 2)    -- 2×2×2 stud cube; resize to taste
 
-	self.Tween = TweenService:Create(Bullet, TI, Goal)
-	self.Tween:Play()
+	self.Tween = TweenService:Create(Bullet, TI, Goal) -- Create the position tween from spawn to target
+	self.Tween:Play()                                   -- Begin the tween immediately
 
-	-- Destroy the bullet when the tween finishes.
+	-- Destroy the bullet part as soon as it reaches the target so we don't leak instances.
 	self.Tween.Completed:Connect(function()
-		Bullet:Destroy()
+		Bullet:Destroy() -- Remove the bullet from the workspace when the tween finishes
 	end)
 
-	-- Safety cleanup in case something interrupts the tween.
+	-- Fallback: Debris removes the bullet after (Distance / 2.5) seconds in case the tween is cancelled or interrupted.
 	Debris:AddItem(Bullet, Distance / 2.5)
 end
 
@@ -334,16 +329,16 @@ end
 	Lerp keeps turning smooth instead of snapping instantly.
 ]]
 function TowerClass.AimAt(self: TowerClass, dt: number)
-	local head = self.Model.PrimaryPart
-	if not head or not self:ValidateTarget() then
+	local head = self.Model.PrimaryPart                    -- The part that physically rotates to face the enemy
+	if not head or not self:ValidateTarget() then          -- Abort if the tower has no root part or the target is gone
 		return
 	end
 
-	local headpos: Vector3 = head.Position
-	local targetpos: Vector3 = self.Target.PrimaryPart.Position
+	local headpos: Vector3 = head.Position                            -- Current world position of the tower's root part
+	local targetpos: Vector3 = self.Target.PrimaryPart.Position       -- Current world position of the enemy's root part
 
-	local desired = CFrame.lookAt(headpos, Vector3.new(targetpos.X, targetpos.Y, targetpos.Z))--the desired angle it should lerp to
-	head.CFrame = head.CFrame:Lerp(desired, math.clamp(dt * 8, 0, 1)) --lerping the rotation
+	local desired = CFrame.lookAt(headpos, Vector3.new(targetpos.X, targetpos.Y, targetpos.Z)) -- Construct a CFrame at headpos oriented so +Z points at the target
+	head.CFrame = head.CFrame:Lerp(desired, math.clamp(dt * 8, 0, 1)) -- Lerp from current rotation toward desired; dt*8 controls turn speed, clamped to [0,1]
 end
 
 --[[
@@ -351,15 +346,15 @@ end
 	At max range, damage is reduced by up to 30%.
 ]]
 function TowerClass.CalculateDamage(self: TowerClass): number
-	if not self:ValidateTarget() then
+	if not self:ValidateTarget() then -- If there's no valid target, return base damage with no falloff
 		return self.Damage
 	end
 
-	local Distance = CalculateDistance(self.Model, self.Target)
-	local alpha = math.clamp(Distance / self.Range, 0, 1)
-	local mult = 1 - 0.3 * alpha
+	local Distance = CalculateDistance(self.Model, self.Target)  -- Measure current distance to the target
+	local alpha = math.clamp(Distance / self.Range, 0, 1)        -- Normalise distance to [0, 1]: 0 = point-blank, 1 = max range
+	local mult = 1 - 0.3 * alpha                                 -- Multiplier goes from 1.0 (full damage) down to 0.7 (30% reduction at max range)
 
-	return math.round(self.Damage * mult)
+	return math.round(self.Damage * mult) -- Apply multiplier and round to the nearest integer for clean damage numbers
 end
 
 --[[
@@ -369,17 +364,17 @@ end
 	- Stops/destroys any active bullet tween
 ]]
 function TowerClass.CleanUp(self: TowerClass)
-	if self.func then
-		self.func:Disconnect()
+	if self.func then          -- Only disconnect if a connection was ever established
+		self.func:Disconnect() -- Stop the RenderStepped loop so this tower no longer receives updates
 	end
 
-	if self.Model then
-		self.Model:Destroy()
+	if self.Model then          -- Only destroy if the model reference is still valid
+		self.Model:Destroy()    -- Remove the tower model from the workspace
 	end
 
-	if self.Tween then
-		self.Tween:Pause()
-		self.Tween:Destroy()
+	if self.Tween then          -- Only touch the tween if one was ever created
+		self.Tween:Pause()      -- Pause first to stop any in-progress animation immediately
+		self.Tween:Destroy()    -- Release the Tween object and its internal connections
 	end
 end
 
@@ -387,21 +382,14 @@ end
 	Enable tower updates/attacks.
 ]]
 function TowerClass.Activate(self: TowerClass)
-	self.IsActive = true
+	self.IsActive = true -- Set the master switch to true; Update() will resume normal logic next frame
 end
 
 --[[
 	Disable tower updates/attacks.
 ]]
 function TowerClass.Disable(self: TowerClass)
-	self.IsActive = false
+	self.IsActive = false -- Set the master switch to false; Update() will return early every frame until re-activated
 end
 
-return TowerClass
-
-
-
-
-
-
-
+return TowerClass -- Export the class table so other scripts can require() it and call TowerClass.new()
